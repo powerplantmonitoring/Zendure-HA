@@ -68,6 +68,9 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.p1_history: deque[int] = deque([25, -25], maxlen=8)
         self.p1_factor = 1
         self.update_count = 0
+        # Devices currently in a force-charge cycle: start below minSoc - 2,
+        # keep charging until minSoc is reached.
+        self.forcecharge_devices: set[str] = set()
 
         self.charge: list[ZendureDevice] = []
         self.charge_limit = 0
@@ -255,6 +258,59 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 for d in fg.devices:
                     d.fuseGrp = fg
                 self.fuseGroups.append(fg)
+
+    async def power_forcecharge(self) -> None:
+        #Force-charge devices whose SOC dropped strictly below their minSoc.
+
+        #Bewusst NICHT ueber DeviceState.SOCEMPTY geprueft: SOCEMPTY wird in
+        #device.power_get() bereits bei electricLevel <= minSoc gesetzt (<=, nicht <)
+        #und zusaetzlich durch das hardwareseitige socLimit ausgeloest, das unabhaengig
+        #von minSoc auftreten kann. Fuer die Zwangsladung brauchen wir den exakten,
+        #strikten Vergleich electricLevel < minSoc.
+
+        #Nur relevant im ManagerMode.MATCHING ("Smarte Leistungsregelung"): das normale
+        #P1-basierte Matching zieht sonst nie aktiv Strom aus dem Netz, um zu laden.
+        
+        for d in list(self.charge) + list(self.discharge) + list(self.idle):
+            soc = d.electricLevel.asInt
+            start_soc = d.minSoc.asNumber - 3
+            target_soc = d.minSoc.asNumber
+
+            # Start only below 7% (minSoc - 3), then latch the force-charge
+            # cycle so it continues through 7-9% and stops at 10% (minSoc).
+            if d.deviceId in self.forcecharge_devices:
+                if soc >= target_soc:
+                    self.forcecharge_devices.discard(d.deviceId)
+                    _LOGGER.info(
+                        "Force charging finished for %s: SOC %s%% reached target %s%%",
+                        d.name, soc, target_soc,
+                    )
+                    continue
+            else:
+                if soc >= start_soc:
+                    continue
+                self.forcecharge_devices.add(d.deviceId)
+
+            _LOGGER.info(
+                "Force charging %s: SOC %s%% -> target %s%% (%sW from grid)",
+                d.name, soc, target_soc, SmartMode.FORCECHARGE_POWER,
+            )
+            await d.power_charge(-SmartMode.FORCECHARGE_POWER)
+
+            if d in self.charge:
+                self.charge.remove(d)
+                self.charge_limit -= d.fuseGrp.charge_limit(d)
+                self.charge_optimal -= d.charge_optimal
+                self.charge_weight -= d.pwr_max * (100 - d.electricLevel.asInt)
+            elif d in self.discharge:
+                self.discharge.remove(d)
+                self.discharge_limit -= d.fuseGrp.discharge_limit(d)
+                self.discharge_optimal -= d.discharge_optimal
+                self.discharge_produced += d.pwr_produced
+                self.discharge_weight -= d.pwr_max * d.electricLevel.asInt
+            elif d in self.idle:
+                self.idle.remove(d)
+
 
     async def update_operation(self, entity: ZendureSelect, _operation: Any) -> None:
         operation = ManagerMode(entity.value)
@@ -491,10 +547,13 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         _LOGGER.info("P1 ======> p1:%s isFast:%s, setpoint:%sW stored:%sW", p1, isFast, setpoint, self.produced)
         match self.operation:
             case ManagerMode.MATCHING:
+                await self.power_forcecharge()
                 if setpoint < 0:
-                    await self.power_charge(setpoint, time)
+                   # await self.power_charge(min(0,setpoint + SmartMode.CHARGE_GRID_MARGIN), time)
+                   await self.power_charge(setpoint, time)
                 else:
-                    await self.power_discharge(setpoint)
+                   # await self.power_discharge(max(0,setpoint- SmartMode.DISCHARGE_GRID_MARGIN)
+                   await self.power_discharge(setpoint)
 
             case ManagerMode.MATCHING_DISCHARGE:
                 # Discharge to cover demand and always pass through available solar; never charge
